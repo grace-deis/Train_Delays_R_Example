@@ -1,0 +1,921 @@
+---
+title: "DATA70121CourseworkAssignment"
+output:
+  html_document:
+    df_print: paged
+---
+```{r, echo= FALSE, results = FALSE, warning =FALSE, message=FALSE}
+#Load packages
+library(fastDummies)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+```
+
+```{r, echo= FALSE, results = FALSE, warning =FALSE, message=FALSE}
+#Read CSV
+data <-read.csv("MavenRail.csv")
+
+#Change date to POSIXct type
+data$Departure <- as.POSIXct( data$Departure, format="%Y-%m-%d %H:%M" )
+data$Scheduled.Arrival <- as.POSIXct( data$Scheduled.Arrival, format="%Y-%m-%d %H:%M" )
+data$Actual.Arrival <- as.POSIXct( data$Actual.Arrival, format="%Y-%m-%d %H:%M" )
+sapply(data, class)
+
+#Remove spaces from strings in columns so dummy variable encoding can be done later one (code from: https://stackoverflow.com/questions/20760547/removing-whitespace-from-a-whole-data-frame-in-r)
+data <- data %>%
+  mutate(Departure.Station = gsub('\\s+', '', Departure.Station))
+
+# Add another column where it encodes Refund.Request where Yes = 1 and No = 0 to make regression easier
+data <- data %>%
+  mutate(refund_encoded = ifelse(data$Refund.Request == "Yes", 1, 0))
+
+NotOnTime <- filter(data, Journey.Status != "On Time")
+```
+
+### Q1: Description of the Data
+The data used in this report comes from Maven Analytics, an organization that provides training in data science.  This data set contains information about simulated train journeys within the UK, capturing details such as  train schedules, ticket sales (in pounds), passenger demographics, and operational performance. It contains information about more than 31,000 journeys.
+
+
+### Q2: Exploratory Data Analysis
+
+The data set has very few missing values. It appears that there are 1,880 missing Actual Arrivals.  
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Sum rows in each column where the value is NA and return the dataframe
+missing <- colSums(is.na(data))
+missing
+```
+
+However, by filtering by Journey.Status= "On Time", it is clear that this is because those trains were cancelled and therefore never arrived.
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Remove cancelled journeys and repeat
+filt <- filter(data, Journey.Status !="Cancelled")
+cancelled_missing <- colSums(is.na(filt))
+cancelled_missing
+```
+After filtering, there is still 3 missing values in Actual.Arrival and Departure and 4 missing values in Scheduled.Arrival. However, with a dataset of over 31,000 three values will not have a large impact on the final statistical analysis. If these missing values become an issue later, the rows can be excluded from analysis. Because they represent times, it would be difficult to replace with a summary statistic such as a mean, so they would have to be removed. 
+
+
+
+Now that it has been established the data is mostly complete, it is possible to visualise which variables have the greatest impact on refund requests. 
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Establish relationship between delayed/cancelled and refund
+bar_filt <- filter(data)
+ggplot(bar_filt, aes(x=Journey.Status, fill=Refund.Request)) +
+  geom_bar() +
+  labs(
+    title = "Refund Requests Per Journey Status",
+    x = "Journey Status",
+    y = "Count"
+  ) +
+  scale_fill_discrete(name = "Refund Requested?")
+```
+
+The bar chart shows that only journeys that were delayed have been delayed or cancelled have received refund requests. As the analysis seeks to understand which factors increase the chances of a refund being requested, a train being on time is a clear indicator that a refund was requested, and the rest of the analysis will focus on which factors in delayed or cancelled journeys increase the odds of a refund being requested.
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+refund_data <- data %>%
+  filter(Journey.Status != "On Time") %>%
+  # Filter for Cancelled and Delayed only
+  group_by(Journey.Status, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  # Calculate the total count for each Journey.Status
+  group_by(Journey.Status) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  # Calculate the percentage of refund requests within each Journey.Status
+  mutate(percentage = (count / total_count) * 100)
+
+# Create the pie chart
+ggplot(refund_data, aes(x = Journey.Status, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") +  # Create bars with the percentage value
+ geom_text(aes(label = paste0(round(percentage, 1), "%")),  # Add percentage labels
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") +  # Adjust text position above bars
+  labs(
+    title = "Percent of Refund Requested",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+30.4% of journeys that are cancelled recieve refund requests, while only 23.8% of delayed journeys do. While there isn't a massive difference, this will be good to keep in mind when creating a model.
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Mutate data in pipeline so we have data about which percentage of trains are on time, cancelled, and delayed from each station
+percentage_data <- data %>%
+  #Group by departure station and journey status
+  group_by(Departure.Station, Journey.Status) %>%   
+  #Count how many journeys are listed as each status and departure station, then ungroup
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(Departure.Station) %>%
+  #Group by departure station and calculate which the percentage of trains that were on time, delayed, or cancelled
+  mutate(Percentage = Count / sum(Count) * 100)
+
+#Create a bar chart that shows the percentage of trains on time, delayed, or cancelled at each departure station
+ggplot(percentage_data, aes(x = Journey.Status, y = Percentage, fill = Journey.Status)) +
+  geom_bar(stat = "identity") + 
+  # Split into panels by departure station
+  facet_wrap(~ Departure.Station) + 
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), position = position_stack(vjust = 0.5), size = 3, vjust= -0.5) + 
+  labs(
+    title = "Journey Status by Departure Station (Percentage of Outbound Trains)",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Journey Status"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(.05, .05, .05, .05, "cm")
+  )
+```
+
+
+
+This analysis reveals that most stations have trains that depart on time approximately 90% of the time. The notable exception is Edinburgh Waverley, where 100% of departing trains were delayed. Given that prior analysis has shown a higher likelihood of refund requests for cancelled and delayed trains, and considering that delay and cancellation rates vary by station, the departure station may be a significant predictor in the regression model.
+
+
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+ggplot(data, aes(x = Price, fill = Refund.Request)) +
+  geom_density(alpha = 0.5) +  # Alpha controls the transparency for overlaid densities
+  labs(
+    title = "Price Distribution by Refund Requested",
+    x = "Price",
+    y = "Density",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+This graph shows the density of price payed for a ticket, split by whether the person requested a refund. They appear to be about the same, suggesting that price isn't a huge factor in whether someone requests a refund.
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+data %>%
+  group_by(Refund.Request) %>%
+  summarise(
+    AveragePrice = mean(Price, na.rm = TRUE)
+  )
+``` 
+
+However, by looking at the average price of a refund request ticket compared to one where no refund was requested, we can see that the average price is higher if a refund was requested.
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+data <- data %>%
+  mutate(DelayInMinutes = ifelse(Journey.Status == "Delayed", as.numeric(difftime(Actual.Arrival, Scheduled.Arrival, units="mins")), NA))
+
+delay_binned_data <- data %>%
+  filter(Journey.Status == "Delayed") %>%
+  group_by(DelayInMinutes) %>%
+  summarize(
+    delay_total = n(),  # Total journeys for each price
+    bin_ref_tot = sum(refund_encoded, na.rm = TRUE),  # Total refunds in each price group
+    bin_prop = bin_ref_tot / delay_total
+  ) 
+
+ggplot(delay_binned_data, aes(x = DelayInMinutes, y = bin_prop)) +
+  geom_point() +
+  labs (
+    title = "Refund Request Rate Per Delay Duration",
+    x = "Delay (in Minutes)",
+    y = "Proportion of Journeys with Refund Requests"
+  )
+```
+
+
+
+There does appear to be a correlation between the proportion of refund requests and length of a delay. When delay increases, it appears that the proportion of customers requesting a refund decreases.
+
+
+
+
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+pay_data <- data %>%
+  group_by(Payment.Method, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  # Calculate the total count for each payment method
+  group_by(Payment.Method) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  # Calculate the percentage of refund requests within each method
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(pay_data, aes(x = Payment.Method, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") +  # Create bars with the percentage value
+ geom_text(aes(label = paste0(round(percentage, 1), "%")),  # Add percentage labels
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") +  # Adjust text position above bars
+  labs(
+    title = "Percent of Refund Requested Per Payment Method",
+    x = "Payment Method",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+Of people who used the varying payment methods, it appears tickets paid for with a debit card receive significantly more refund requests than journeys paid for with contactless or credit card. 
+
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+card_data <- data %>%
+  group_by(Railcard, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Railcard) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(card_data, aes(x = Railcard, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") + 
+  geom_text(aes(label = paste0(round(percentage, 1), "%")),
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") + 
+  labs(
+    title = "Percent of Refund Requested for Railcard Type",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+There does appear to be some difference in the rates railcard users request refunds. Adults using a railcard are twice as likely to request a refund as the next most likely railcard holder category (Senior). Railcard usage could be a factor in the regression model.
+
+
+
+
+
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+class_data <- data %>%
+  group_by(Ticket.Class, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Ticket.Class) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(class_data, aes(x = Ticket.Class, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") + 
+  geom_text(aes(label = paste0(round(percentage, 1), "%")),
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") + 
+  labs(
+    title = "Percent of Refund Requested for Ticket Class",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+The rates for refund requests between first class and standard are roughly the same, so this most likely does not impact whether a person will request a refund or not.
+
+
+### Q3: Add DelayInMinutes Column
+
+```{r, warning =FALSE, message=FALSE}
+# If Journey Status is "Delayed", then add total delay in minutes by subtracting Scheduled and Actual, if FALSE, insert NA
+data <- data %>%
+  mutate(DelayInMinutes = ifelse(Journey.Status == "Delayed", as.numeric(difftime(Actual.Arrival, Scheduled.Arrival, units="mins")), NA))
+head(data)
+```
+
+### Q4:Use Regression to Predit Probability of Refund Request
+
+I filtered the data set to only include not on time journeys and created a MediumPrice column
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+# Select all journeys where Journey Status is not "On Time" and put it in its own data frame
+NotOnTime <- filter(data, Journey.Status != "On Time")
+
+# If the price is between 30 and 10, insert TRUE in a new column "MediumPrice", if not insert FALSE
+NotOnTime <- NotOnTime %>%
+  mutate(MediumPrice = ifelse(30 >= NotOnTime$Price & NotOnTime$Price > 10, TRUE, FALSE))
+head(NotOnTime)
+```
+
+
+
+I fit a logistic regression model, as it will return the probability of an event, not the correlation as a linear regression would
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Create a logistic regression model 
+refund = glm(refund_encoded ~ MediumPrice, data= NotOnTime, family= "binomial")
+summary(refund)
+```
+
+Then, using the equation from the Week 5 lecture notes:
+$$
+\log\left(\frac{p_i}{1 - p_i}\right) = \beta_0 + \beta_1 \cdot MediumPrice
+$$
+Plug in the information from the regression, where $\beta_0 = -1.07572$ and $\beta_1 = 0.35440$.
+Because £5 does not fall within the £10 < Price < £30 range given for MediumPrice, 0 is used in the equation.
+
+$$
+\log\left(\frac{p_i}{1 - p_i}\right) = -1.07572 + 0.35440 \cdot 0
+\newline
+\frac{p_i}{1 - p_i}\ = e^{-1.07572}
+\newline
+p_i = e^{-1.07572} - e^{-1.07572} \cdot p_i
+\newline
+1.341 \cdot p_i= 0.341
+\newline
+p_i= 0.254
+$$
+Given a passenger paid £5 for their ticket, there is a 0.254 probability they will request a refund.
+
+
+
+This time, because £25 does fall within the £10 < Price < £30 range given for MediumPrice, 1 is used in the equation.
+$$
+\log\left(\frac{p_i}{1 - p_i}\right) = -1.07572 + (0.35440 \cdot 1)
+\newline
+\frac{p_i}{1 - p_i}\ = e^{-0.72132}
+\newline
+p_i = e^{-0.72132} - e^{-0.72132} \cdot p_i
+\newline
+1.486 \cdot p_i= 0.486
+\newline
+p_i= 0.327
+$$
+Given a passenger paid £25 for their ticket, there is a 0.327 probability they will request a refund.
+
+
+
+### Q5: Regression Model to Predict Refund
+I began by splitting the data into test (20%) and training (80%).
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+data <- data %>%
+  mutate(Railcard.Owner = ifelse(Railcard != "None", 1, 0))
+
+set.seed(123)  # Set a seed for reproducibility
+train_index <- createDataPartition(data$refund_encoded, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+I started with a very simple model: status_model, that only took into account the Journey.Status, since On Time trains don't receive refund requests.
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+status_model = glm(refund_encoded ~ Journey.Status, data = train_data, family = "binomial")
+
+summary(status_model)
+```
+
+
+
+Because Edinburgh Waverly's delay rate was so high, I was interested in seeing what impact departure station had on the model in addition to the Journey Status, so I fit the model departure_station_model
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+departure_station_model <- glm(refund_encoded ~ Journey.Status + Departure.Station,
+                                data = train_data, family = "binomial")
+summary(departure_station_model)
+```
+
+I also fit a model that included Journey.Status, Price, Railcard, and Payment.Method as those seemed to have the strongest correlation exhibited during EDA. To simplify the process, instead of encoding the railcard variable, I created a new column: Railcard.Owner, that was 1 if the passenger had any railcard and 0 if they had none. This was called price_model.
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+price_model <- glm(refund_encoded ~ Journey.Status + Price + Railcard.Owner + Payment.Method,
+                                data = train_data, family = "binomial")
+
+summary(price_model)
+```
+
+Finally, I wanted another simple model, so I fit one that only incorporated Journey.Status and Price
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+simple_model <- glm(refund_encoded ~ Journey.Status + Price,
+                                data = train_data, family = "binomial")
+
+summary(simple_model)
+```
+
+
+I considered including a DelayInMinutes predictor in the model but ultimately decided against it. The main challenge was that it was difficult to accurately distinguish whether missing values for DelayInMinutes were due to no delay or because the train was cancelled. Instead, I opted to use the Journey.Status predictor, as it effectively captures the impact of delays and cancellations on the likelihood of a refund request.
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#Use the test data to make predictions based on the models
+pred_status <- predict(status_model, test_data, type = "response")
+pred_departure <- predict(departure_station_model, test_data, type = "response")
+pred_price <- predict(price_model, test_data, type = "response")
+pred_simple <- predict(simple_model, test_data, type = "response")
+
+# Because predict() can return values other than 1 or 0 (which are meaningless in this scenario), convert predicted values to factors with the same levels as the actual values
+pred_status_bin <- ifelse(pred_status > 0.5, 1, 0)
+pred_departure_bin <- ifelse(pred_departure > 0.5, 1, 0)
+pred_price_bin <- ifelse(pred_price > 0.5, 1, 0)
+pred_simple_bin <- ifelse(pred_simple > 0.5, 1, 0)
+
+actual_refund <- factor(test_data$refund_encoded, levels = c(0, 1))
+
+# Compare predicted and actual values for each model
+
+# Function to calculate accuracy and percentage of matches
+calculate_accuracy <- function(predicted, actual) {
+  match_count <- sum(predicted == actual)
+  total_count <- length(actual)
+  percentage <- (match_count / total_count) * 100
+  return(c(match_count = match_count, percentage = percentage))
+}
+
+# Compare predictions and calculate the number of matches and percentage for each model
+status_accuracy <- calculate_accuracy(pred_status_bin, actual_refund)
+departure_accuracy <- calculate_accuracy(pred_departure_bin, actual_refund)
+price_accuracy <- calculate_accuracy(pred_price_bin, actual_refund)
+simple_accuracy <- calculate_accuracy(pred_simple_bin, actual_refund)
+
+# Print results
+cat("Status Model Accuracy:\n")
+cat("Matches:", status_accuracy["match_count"], "Percentage:", status_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Departure Station Model Accuracy:\n")
+cat("Matches:", departure_accuracy["match_count"], "Percentage:", departure_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Price Model Accuracy:\n")
+cat("Matches:", price_accuracy["match_count"], "Percentage:", price_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Simple Model Accuracy:\n")
+cat("Matches:", simple_accuracy["match_count"], "Percentage:", simple_accuracy["percentage"], "%\n")
+```
+
+The price model was the most accurate with a score of 97.9%, meaning 97.9% of the time, when the model predicted a refund would be requested, it was. However, measures other than accuracy are important when evaluating a model.
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+calculate_confusion_matrix <- function(predicted, actual) {
+  TP <- sum(predicted == 1 & actual == 1)
+  FP <- sum(predicted == 1 & actual == 0)
+  TN <- sum(predicted == 0 & actual == 0)
+  FN <- sum(predicted == 0 & actual == 1)
+  
+  return(data.frame(TP = TP, FP = FP, TN = TN, FN = FN))
+}
+
+# Get confusion matrix components for each model
+status_cm <- calculate_confusion_matrix(pred_status_bin, actual_refund)
+departure_cm <- calculate_confusion_matrix(pred_departure_bin, actual_refund)
+price_cm <- calculate_confusion_matrix(pred_price_bin, actual_refund)
+simple_cm <- calculate_confusion_matrix(pred_simple_bin, actual_refund)
+
+# Combine the results into a single table
+cm_table <- data.frame(
+  Model = c("Status Model", "Departure Station Model", "Price Model", "Simple Model"),
+  TP = c(status_cm$TP, departure_cm$TP, price_cm$TP, simple_cm$TP),
+  FP = c(status_cm$FP, departure_cm$FP, price_cm$FP, simple_cm$FP),
+  TN = c(status_cm$TN, departure_cm$TN, price_cm$TN, simple_cm$TN),
+  FN = c(status_cm$FN, departure_cm$FN, price_cm$FN, simple_cm$FN)
+)
+
+cm_table
+```
+
+
+The table above indicates that while the price model achieves the highest number of true positives, it also results in a relatively high number of false positives. Although this could be a concern, in the context of this scenario, the implications are minimal. A rail company may find it manageable since an overprediction of refund requests would not have severe consequences. However, accurately forecasting the volume of refund requests is crucial for the company to plan its budget effectively. False negatives, where refund requests are not predicted, could lead to under-budgeting, which is a significant concern. As the table demonstrates, the price model has the lowest rate of false negatives, making it the most reliable model for predicting refund requests. Therefore, I concluded that the price model is the best predictor for this scenario.
+
+
+```{r, echo= FALSE, warning =FALSE, message=FALSE}
+#read in ToPredict.csv
+predict=read.csv("ToPredict.csv")
+
+
+predict <- predict %>%
+  mutate(Railcard.Owner = ifelse(Railcard != "None", 1, 0))
+
+predicted_status <- predict(price_model, predict, type = "response")
+
+predicted_status_bin <- ifelse(predicted_status > 0.5, 1, 0)
+
+predict$predicted_refund <- predicted_status_bin
+
+head(predict)
+```
+
+
+
+### References
+Confusion matrix: https://www.digitalocean.com/community/tutorials/confusion-matrix-in-r
+
+
+Week 5 Lecture Notes
+
+
+GGPlot Bar Plot: https://r-graph-gallery.com/48-grouped-barplot-with-ggplot2
+
+## Data Set Up
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Load packages
+library(fastDummies)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+```
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Read CSV
+data <-read.csv("MavenRail.csv")
+
+#Change date to POSIXct type
+data$Departure <- as.POSIXct( data$Departure, format="%Y-%m-%d %H:%M" )
+data$Scheduled.Arrival <- as.POSIXct( data$Scheduled.Arrival, format="%Y-%m-%d %H:%M" )
+data$Actual.Arrival <- as.POSIXct( data$Actual.Arrival, format="%Y-%m-%d %H:%M" )
+sapply(data, class)
+
+#Remove spaces from strings in columns so dummy variable encoding can be done later one (code from: https://stackoverflow.com/questions/20760547/removing-whitespace-from-a-whole-data-frame-in-r)
+data <- data %>%
+  mutate(Departure.Station = gsub('\\s+', '', Departure.Station))
+
+# Add another column where it encodes Refund.Request where Yes = 1 and No = 0 to make regression easier
+data <- data %>%
+  mutate(refund_encoded = ifelse(data$Refund.Request == "Yes", 1, 0))
+
+NotOnTime <- filter(data, Journey.Status != "On Time")
+```
+
+## Q2
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Missing data
+#Sum rows in each column where the value is NA and return the dataframe
+missing <- colSums(is.na(data))
+missing
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Missing data with cancelled journeys removed
+#Remove cancelled journeys and repeat
+filt <- filter(data, Journey.Status !="Cancelled")
+cancelled_missing <- colSums(is.na(filt))
+cancelled_missing
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Refund Requests Per Journey Status Chart
+#Establish relationship between delayed/cancelled and refund
+bar_filt <- filter(data)
+ggplot(bar_filt, aes(x=Journey.Status, fill=Refund.Request)) +
+  geom_bar() +
+  labs(
+    title = "Refund Requests Per Journey Status",
+    x = "Journey Status",
+    y = "Count"
+  ) +
+  scale_fill_discrete(name = "Refund Requested?")
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Percent of cancelled and delayed journeys with a refund request chart
+
+refund_data <- data %>%
+  filter(Journey.Status != "On Time") %>%
+  # Filter for Cancelled and Delayed only
+  group_by(Journey.Status, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  # Calculate the total count for each Journey.Status
+  group_by(Journey.Status) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  # Calculate the percentage of refund requests within each Journey.Status
+  mutate(percentage = (count / total_count) * 100)
+
+# Create chart
+ggplot(refund_data, aes(x = Journey.Status, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") +  
+ geom_text(aes(label = paste0(round(percentage, 1), "%")),  # Add percentage labels
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") +  # Adjust text position above bars
+  labs(
+    title = "Percent of Refund Requested",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Delayed, cancelled, and on time trains departing from each station
+
+#Mutate data in pipeline so we have data about which percentage of trains are on time, cancelled, and delayed from each station
+percentage_data <- data %>%
+  #Group by departure station and journey status
+  group_by(Departure.Station, Journey.Status) %>%   
+  #Count how many journeys are listed as each status and departure station, then ungroup
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(Departure.Station) %>%
+  #Group by departure station and calculate which the percentage of trains that were on time, delayed, or cancelled
+  mutate(Percentage = Count / sum(Count) * 100)
+
+#Create a bar chart that shows the percentage of trains on time, delayed, or cancelled at each departure station
+ggplot(percentage_data, aes(x = Journey.Status, y = Percentage, fill = Journey.Status)) +
+  geom_bar(stat = "identity") + 
+  # Split into panels by departure station
+  facet_wrap(~ Departure.Station) + 
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), position = position_stack(vjust = 0.5), size = 3, vjust= -0.5) + 
+  labs(
+    title = "Journey Status by Departure Station (Percentage of Outbound Trains)",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Journey Status"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(.05, .05, .05, .05, "cm")
+  )
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Price density graph
+ggplot(data, aes(x = Price, fill = Refund.Request)) +
+  geom_density(alpha = 0.5) + 
+  labs(
+    title = "Price Distribution by Refund Requested",
+    x = "Price",
+    y = "Density",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Table with average price of a refund requested ticket vs not
+
+data %>%
+  group_by(Refund.Request) %>%
+  summarise(
+    AveragePrice = mean(Price)
+  )
+``` 
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Scatterplot proprotion of refund requests per delay duration
+data <- data %>%
+  mutate(DelayInMinutes = ifelse(Journey.Status == "Delayed", as.numeric(difftime(Actual.Arrival, Scheduled.Arrival, units="mins")), NA))
+
+delay_binned_data <- data %>%
+  filter(Journey.Status == "Delayed") %>%
+  group_by(DelayInMinutes) %>%
+  summarize(
+    delay_total = n(),  # Total journeys for each price
+    bin_ref_tot = sum(refund_encoded, na.rm = TRUE),  # Total refunds in each price group
+    bin_prop = bin_ref_tot / delay_total
+  ) 
+
+ggplot(delay_binned_data, aes(x = DelayInMinutes, y = bin_prop)) +
+  geom_point() +
+  labs (
+    title = "Refund Request Rate Per Delay Duration",
+    x = "Delay (in Minutes)",
+    y = "Proportion of Journeys with Refund Requests"
+  )
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Percent of Refund Requested per payment method
+pay_data <- data %>%
+  group_by(Payment.Method, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  # Calculate the total count for each payment method
+  group_by(Payment.Method) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  # Calculate the percentage of refund requests within each method
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(pay_data, aes(x = Payment.Method, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") +  # Create bars with the percentage value
+ geom_text(aes(label = paste0(round(percentage, 1), "%")),  # Add percentage labels
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") +  # Adjust text position above bars
+  labs(
+    title = "Percent of Refund Requested Per Payment Method",
+    x = "Payment Method",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Percent of Refund Requested for Railcard Type
+card_data <- data %>%
+  group_by(Railcard, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Railcard) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(card_data, aes(x = Railcard, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") + 
+  geom_text(aes(label = paste0(round(percentage, 1), "%")),
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") + 
+  labs(
+    title = "Percent of Refund Requested for Railcard Type",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Percent refund requests per ticket class
+class_data <- data %>%
+  group_by(Ticket.Class, Refund.Request) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Ticket.Class) %>%
+  mutate(total_count = sum(count)) %>%
+  ungroup() %>%
+  mutate(percentage = (count / total_count) * 100)
+
+ggplot(class_data, aes(x = Ticket.Class, y = percentage, fill = Refund.Request)) +
+  geom_bar(stat = "identity", position="dodge") + 
+  geom_text(aes(label = paste0(round(percentage, 1), "%")),
+            position = position_dodge(width = 0.9), vjust = -0.5, color = "black") + 
+  labs(
+    title = "Percent of Refund Requested for Ticket Class",
+    x = "Journey Status",
+    y = "Percentage",
+    fill = "Refund Requested"
+  )
+```
+
+
+## Q3
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+# If Journey Status is "Delayed", then add total delay in minutes by subtracting Scheduled and Actual, if FALSE, insert NA
+data <- data %>%
+  mutate(DelayInMinutes = ifelse(Journey.Status == "Delayed", as.numeric(difftime(Actual.Arrival, Scheduled.Arrival, units="mins")), NA))
+head(data)
+```
+
+
+## Q4
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+# Select all journeys where Journey Status is not "On Time" and put it in its own data frame
+NotOnTime <- filter(data, Journey.Status != "On Time")
+
+# If the price is between 30 and 10, insert TRUE in a new column "MediumPrice", if not insert FALSE
+NotOnTime <- NotOnTime %>%
+  mutate(MediumPrice = ifelse(30 >= NotOnTime$Price & NotOnTime$Price > 10, TRUE, FALSE))
+head(NotOnTime)
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Create a logistic regression model 
+refund = glm(refund_encoded ~ MediumPrice, data= NotOnTime, family= "binomial")
+summary(refund)
+```
+
+## Q5
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Add column railcard owner
+#Split data test and train, setting seed so split is the same each time
+data <- data %>%
+  mutate(Railcard.Owner = ifelse(Railcard != "None", 1, 0))
+
+set.seed(123)  # Set a seed for reproducibility
+train_index <- createDataPartition(data$refund_encoded, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Status model
+status_model = glm(refund_encoded ~ Journey.Status, data = train_data, family = "binomial")
+
+summary(status_model)
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+departure_station_model <- glm(refund_encoded ~ Journey.Status + Departure.Station,
+                                data = train_data, family = "binomial")
+summary(departure_station_model)
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+price_model <- glm(refund_encoded ~ Journey.Status + Price + Railcard.Owner + Payment.Method,
+                                data = train_data, family = "binomial")
+
+summary(price_model)
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+simple_model <- glm(refund_encoded ~ Journey.Status + Price,
+                                data = train_data, family = "binomial")
+
+summary(simple_model)
+```
+
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+#Use the test data to make predictions based on the models
+pred_status <- predict(status_model, test_data, type = "response")
+pred_departure <- predict(departure_station_model, test_data, type = "response")
+pred_price <- predict(price_model, test_data, type = "response")
+pred_simple <- predict(simple_model, test_data, type = "response")
+
+# Because predict() can return values other than 1 or 0 (which are meaningless in this scenario), convert predicted values to factors with the same levels as the actual values
+pred_status_bin <- ifelse(pred_status > 0.5, 1, 0)
+pred_departure_bin <- ifelse(pred_departure > 0.5, 1, 0)
+pred_price_bin <- ifelse(pred_price > 0.5, 1, 0)
+pred_simple_bin <- ifelse(pred_simple > 0.5, 1, 0)
+
+actual_refund <- factor(test_data$refund_encoded, levels = c(0, 1))
+
+
+# Function to calculate accuracy and percentage of matches
+calculate_accuracy <- function(predicted, actual) {
+  match_count <- sum(predicted == actual)
+  total_count <- length(actual)
+  percentage <- (match_count / total_count) * 100
+  return(c(match_count = match_count, percentage = percentage))
+}
+
+# Compare predictions and calculate the number of matches and percentage for each model
+status_accuracy <- calculate_accuracy(pred_status_bin, actual_refund)
+departure_accuracy <- calculate_accuracy(pred_departure_bin, actual_refund)
+price_accuracy <- calculate_accuracy(pred_price_bin, actual_refund)
+simple_accuracy <- calculate_accuracy(pred_simple_bin, actual_refund)
+
+# Print results
+cat("Status Model Accuracy:\n")
+cat("Matches:", status_accuracy["match_count"], "Percentage:", status_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Departure Station Model Accuracy:\n")
+cat("Matches:", departure_accuracy["match_count"], "Percentage:", departure_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Price Model Accuracy:\n")
+cat("Matches:", price_accuracy["match_count"], "Percentage:", price_accuracy["percentage"], "%\n")
+cat("\n")
+
+cat("Simple Model Accuracy:\n")
+cat("Matches:", simple_accuracy["match_count"], "Percentage:", simple_accuracy["percentage"], "%\n")
+```
+
+
+```{r, results = FALSE, warning =FALSE, message=FALSE}
+calculate_confusion_matrix <- function(predicted, actual) {
+  TP <- sum(predicted == 1 & actual == 1)
+  FP <- sum(predicted == 1 & actual == 0)
+  TN <- sum(predicted == 0 & actual == 0)
+  FN <- sum(predicted == 0 & actual == 1)
+  
+  return(data.frame(TP = TP, FP = FP, TN = TN, FN = FN))
+}
+
+# Get confusion matrix components for each model
+status_cm <- calculate_confusion_matrix(pred_status_bin, actual_refund)
+departure_cm <- calculate_confusion_matrix(pred_departure_bin, actual_refund)
+price_cm <- calculate_confusion_matrix(pred_price_bin, actual_refund)
+simple_cm <- calculate_confusion_matrix(pred_simple_bin, actual_refund)
+
+# Combine the results into a single table
+cm_table <- data.frame(
+  Model = c("Status Model", "Departure Station Model", "Price Model", "Simple Model"),
+  TP = c(status_cm$TP, departure_cm$TP, price_cm$TP, simple_cm$TP),
+  FP = c(status_cm$FP, departure_cm$FP, price_cm$FP, simple_cm$FP),
+  TN = c(status_cm$TN, departure_cm$TN, price_cm$TN, simple_cm$TN),
+  FN = c(status_cm$FN, departure_cm$FN, price_cm$FN, simple_cm$FN)
+)
+
+cm_table
+```
